@@ -1,15 +1,20 @@
+#Make sure to replace USERNAME and PASSWORD with your own username and password
+
 #Import libraries
 from bs4 import BeautifulSoup
 from lxml import html
+from selenium import webdriver
+from selenium.webdriver.common.keys import Keys
 import csv
 import json
 import re
 import requests
+import time
 import urllib.request
 
 #Login Information
-USERNAME = "zachary.r.williams@gmail.com"
-PASSWORD = "wp5AQNpF2HDsAj"
+USERNAME = "example@gmail.com"
+PASSWORD = "example"
 
 #URLs
 login_url = "https://my.vudu.com/MyLogin.html?type=sign_in&url=https%3A%2F%2Fwww.vudu.com%2F"
@@ -18,14 +23,19 @@ url = "https://www.vudu.com/movies/#my_vudu/my_movies"
 def main():
 	session_requests = requests.session()
 
-	#Create payload
-	payload = {
-		"Email": USERNAME, 
-		"Password": PASSWORD, 
-	}
+	chromedriver = 'C:\\chromedriver.exe'
+	browser = webdriver.Chrome(chromedriver)
+	browser.get('https://my.vudu.com/MyLogin.html?type=sign_in&url=https%3A%2F%2Fwww.vudu.com%2F')
+
+	time.sleep(10)
 	
-	#Perform login
-	result = session_requests.post(login_url, data = payload, headers = dict(referer=login_url))
+	username = browser.find_element_by_name('email')
+	password = browser.find_element_by_name('password')
+	
+	username.send_keys(USERNAME)
+	password.send_keys(PASSWORD)
+	
+	browser.find_element_by_css_selector('.custom-button').click()
 	
 	html = urllib.request.urlopen(url)
 	
