@@ -1,0 +1,228 @@
+# file: tools/vudu_scrape_my_movies.py
+"""
+Scrape Vudu "My Movies" titles after login and write to CSV.
+
+Requires: selenium>=4, (optional) webdriver-manager, Chrome installed.
+Usage:
+  python vudu_scrape_my_movies.py --out movies.csv --headless
+  (credentials via --user/--pass or env VUDU_USER / VUDU_PASS)
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import os
+import sys
+import time
+from dataclasses import dataclass
+from typing import Iterable, List, Set, Tuple
+
+from selenium import webdriver
+from selenium.common.exceptions import TimeoutException, WebDriverException
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
+
+# Optional webdriver-manager (avoids hardcoded chromedriver path).
+try:
+    from webdriver_manager.chrome import ChromeDriverManager  # type: ignore
+except Exception:  # pragma: no cover
+    ChromeDriverManager = None  # type: ignore
+
+LOGIN_URL = "https://my.vudu.com/MyLogin.html?type=sign_in&url=https%3A%2F%2Fwww.vudu.com%2F"
+MY_MOVIES_URL = "https://www.vudu.com/movies/#my_vudu/my_movies"
+
+EMAIL_NAME = "email"         # Stable attr names from login form.
+PASSWORD_NAME = "password"
+SUBMIT_SELECTOR = ".custom-button"  # Login submit button.
+
+MOVIE_IMG_SELECTOR = ".border .gwt-Image"  # Same as original script.
+
+@dataclass(frozen=True)
+class Config:
+    username: str
+    password: str
+    out_csv: str
+    headless: bool
+    page_load_timeout: int
+    wait_timeout: int
+    idle_rounds_limit: int
+    max_minutes: int
+    local_chromedriver: str | None
+
+
+def build_driver(cfg: Config) -> webdriver.Chrome:
+    """Create a Chrome driver with sane defaults."""
+    opts = Options()
+    if cfg.headless:
+        opts.add_argument("--headless=new")
+    opts.add_argument("--disable-gpu")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--window-size=1280,2000")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    # Why: Reduce flaky navigation timeouts on heavy pages
+    opts.page_load_strategy = "normal"
+
+    if cfg.local_chromedriver:
+        service = Service(cfg.local_chromedriver)
+    else:
+        if ChromeDriverManager is None:
+            raise RuntimeError(
+                "webdriver-manager not installed and no --chromedriver path provided."
+            )
+        service = Service(ChromeDriverManager().install())
+
+    driver = webdriver.Chrome(service=service, options=opts)
+    driver.set_page_load_timeout(cfg.page_load_timeout)
+    return driver
+
+
+def wait(driver: webdriver.Chrome, seconds: int) -> WebDriverWait:
+    return WebDriverWait(driver, seconds)
+
+
+def login(driver: webdriver.Chrome, cfg: Config) -> None:
+    driver.get(LOGIN_URL)
+    w = wait(driver, cfg.wait_timeout)
+    # Wait for inputs present & visible
+    email_el = w.until(EC.visibility_of_element_located((By.NAME, EMAIL_NAME)))
+    pass_el = w.until(EC.visibility_of_element_located((By.NAME, PASSWORD_NAME)))
+    email_el.clear()
+    email_el.send_keys(cfg.username)
+    pass_el.clear()
+    pass_el.send_keys(cfg.password)
+    w.until(EC.element_to_be_clickable((By.CSS_SELECTOR, SUBMIT_SELECTOR))).click()
+    # Why: Post-login often redirects; verify by checking URL or a known element appears
+    try:
+        w.until(lambda d: "vudu.com" in d.current_url)
+    except TimeoutException:
+        raise TimeoutException("Login likely failed or timed out; check credentials/2FA/ToS changes.")
+
+
+def navigate_to_my_movies(driver: webdriver.Chrome, cfg: Config) -> None:
+    driver.get(MY_MOVIES_URL)
+    wait(driver, cfg.wait_timeout).until(
+        EC.presence_of_element_located((By.CSS_SELECTOR, MOVIE_IMG_SELECTOR))
+    )
+
+
+def collect_visible_titles(driver: webdriver.Chrome) -> Tuple[List[str], int]:
+    """Return titles from currently rendered thumbnails + count of elements."""
+    imgs = driver.find_elements(By.CSS_SELECTOR, MOVIE_IMG_SELECTOR)
+    titles = []
+    for el in imgs:
+        alt = el.get_attribute("alt") or ""
+        if alt.strip():
+            titles.append(alt.strip())
+    return titles, len(imgs)
+
+
+def infinite_scroll_collect(
+    driver: webdriver.Chrome,
+    cfg: Config,
+) -> List[str]:
+    """Scroll until no new items load for N rounds or max time reached."""
+    seen: Set[str] = set()
+    stable_rounds = 0
+    prev_count = -1
+    deadline = time.time() + cfg.max_minutes * 60
+
+    while True:
+        titles, count = collect_visible_titles(driver)
+        new = 0
+        for t in titles:
+            if t not in seen:
+                seen.add(t)
+                new += 1
+
+        # Heuristic: track DOM count growth; if stagnant, increase stable rounds
+        if count == prev_count and new == 0:
+            stable_rounds += 1
+        else:
+            stable_rounds = 0
+        prev_count = count
+
+        # Exit conditions
+        if stable_rounds >= cfg.idle_rounds_limit:
+            break
+        if time.time() > deadline:
+            break
+
+        # Scroll: JS to bottom; then wait briefly for lazy-load network/render
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+        # Why: give network/render loop time without long sleeps
+        for _ in range(5):
+            time.sleep(0.2)
+
+    return sorted(seen)
+
+
+def write_csv(rows: Iterable[str], out_path: str) -> None:
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+    with open(out_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        for r in rows:
+            writer.writerow([r])
+
+
+def parse_args() -> Config:
+    p = argparse.ArgumentParser(description="Scrape Vudu My Movies to CSV")
+    p.add_argument("--user", dest="username", default=os.getenv("VUDU_USER"), help="Vudu email")
+    p.add_argument("--pass", dest="password", default=os.getenv("VUDU_PASS"), help="Vudu password")
+    p.add_argument("--out", dest="out_csv", default="vudu_movies.csv", help="Output CSV path")
+    p.add_argument("--headless", action="store_true", help="Run Chrome headless")
+    p.add_argument("--pageload", dest="page_load_timeout", type=int, default=60)
+    p.add_argument("--wait", dest="wait_timeout", type=int, default=30)
+    p.add_argument("--idle-rounds", dest="idle_rounds_limit", type=int, default=3,
+                   help="Stop after this many consecutive rounds with no new items")
+    p.add_argument("--max-min", dest="max_minutes", type=int, default=8,
+                   help="Hard stop after N minutes")
+    p.add_argument("--chromedriver", dest="chromedriver", default=os.getenv("CHROMEDRIVER"),
+                   help="Path to local chromedriver binary (skip webdriver-manager)")
+    args = p.parse_args()
+
+    if not args.username or not args.password:
+        print("ERROR: Provide credentials via --user/--pass or env VUDU_USER/VUDU_PASS", file=sys.stderr)
+        sys.exit(2)
+
+    return Config(
+        username=args.username,
+        password=args.password,
+        out_csv=args.out_csv,
+        headless=args.headless,
+        page_load_timeout=args.page_load_timeout,
+        wait_timeout=args.wait_timeout,
+        idle_rounds_limit=args.idle_rounds_limit,
+        max_minutes=args.max_minutes,
+        local_chromedriver=args.chromedriver,
+    )
+
+
+def main() -> int:
+    cfg = parse_args()
+    driver = None
+    try:
+        driver = build_driver(cfg)
+        login(driver, cfg)
+        navigate_to_my_movies(driver, cfg)
+        titles = infinite_scroll_collect(driver, cfg)
+        if not titles:
+            print("WARNING: No titles were found; UI/selector may have changed.", file=sys.stderr)
+        write_csv(titles, cfg.out_csv)
+        print(f"OK: wrote {len(titles)} titles to {cfg.out_csv}")
+        return 0
+    except (TimeoutException, WebDriverException) as e:
+        print(f"FAILED: {e.__class__.__name__}: {e}", file=sys.stderr)
+        return 1
+    except Exception as e:  # pragma: no cover
+        print(f"FAILED: {e}", file=sys.stderr)
+        return 1
+    finally:
+        if driver is not None:
+            driver.quit()  # Always clean up
+
+if __name__ == "__main__":
+    sys.exit(main())
